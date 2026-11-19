@@ -178,6 +178,73 @@ def bump_catalog_revision(conn):
     )
 
 
+def normalize_uom(value):
+    uom = clean_barcode(value).upper()
+    return {
+        "PC/KGM": "UN",
+        "PCE": "UN",
+        "PCS": "UN",
+        "UNIT": "UN",
+    }.get(uom, uom)
+
+
+def attach_uom_prices(conn, rows, scanned_ean=None):
+    items = [dict(row) for row in rows]
+    article_codes = list(dict.fromkeys(
+        str(item.get("article_code") or item.get("barcode") or "")
+        for item in items
+        if item.get("barcode") or item.get("article_code")
+    ))
+    prices_by_article = {}
+    for start in range(0, len(article_codes), 500):
+        batch = article_codes[start:start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        price_rows = conn.execute(
+            f"""SELECT article_code, ean_code, uom, price
+                FROM article_prices
+                WHERE article_code IN ({placeholders})
+                ORDER BY uom, ean_code""",
+            batch,
+        ).fetchall()
+        for price_row in price_rows:
+            prices_by_article.setdefault(price_row["article_code"], []).append({
+                "ean_code": price_row["ean_code"],
+                "uom": price_row["uom"],
+                "price": price_row["price"],
+                "price_type": "uom",
+            })
+
+    legacy_prices = (
+        ("CX", "price_cx", "cx"),
+        ("EMB", "price_emb", "emb"),
+        ("UN", "price_pc_kgm", "pc_kgm"),
+        ("BAG", "price_bag", "bag"),
+    )
+    for item in items:
+        article_code = str(item.get("article_code") or item.get("barcode") or "")
+        prices = list(prices_by_article.get(article_code, []))
+        existing_uoms = {price["uom"] for price in prices}
+        for uom, field, price_type in legacy_prices:
+            value = str(item.get(field) or "").strip()
+            if value and uom not in existing_uoms:
+                prices.append({
+                    "ean_code": "",
+                    "uom": uom,
+                    "price": value,
+                    "price_type": price_type,
+                })
+        item["uom_prices"] = prices
+        search_ean = str(scanned_ean or item.get("barcode") or "")
+        item["scanned_price"] = next(
+            (
+                price for price in prices
+                if price["ean_code"] and price["ean_code"].casefold() == search_ean.casefold()
+            ),
+            None,
+        )
+    return items
+
+
 # --- DATABASE SETUP & AUTO-MIGRATION ---
 def init_db():
     with connect_db() as conn:
@@ -259,6 +326,21 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ean_code_lower "
             "ON ean_aliases(LOWER(ean_code))"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS article_prices (
+                article_code TEXT NOT NULL,
+                ean_code TEXT NOT NULL DEFAULT '',
+                uom TEXT NOT NULL,
+                price TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(article_code, ean_code, uom),
+                FOREIGN KEY(article_code) REFERENCES products(barcode) ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_article_prices_ean "
+            "ON article_prices(LOWER(ean_code))"
         )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS system_stock (
@@ -4896,6 +4978,17 @@ HTML_TEMPLATE = """
             </div>
         </dialog>
 
+        <dialog id="ean-price-dialog" class="w-full max-w-sm rounded-2xl p-0 shadow-2xl backdrop:bg-slate-900/60">
+            <div class="p-5">
+                <h2 class="text-lg font-extrabold text-slate-800">Scanned EAN Price</h2>
+                <div id="ean-price-details" class="mt-4"></div>
+                <div class="mt-4 grid grid-cols-2 gap-3">
+                    <button onclick="document.getElementById('ean-price-dialog').close()" class="rounded-xl border border-slate-300 p-3 font-semibold text-slate-700">Close</button>
+                    <button id="ean-price-print" class="rounded-xl bg-indigo-600 p-3 font-bold text-white hover:bg-indigo-700">Print this price</button>
+                </div>
+            </div>
+        </dialog>
+
         <dialog id="manager-action-dialog" class="w-full max-w-sm rounded-2xl p-0 shadow-2xl backdrop:bg-slate-900/60">
             <form method="dialog" class="p-5" onsubmit="return false">
                 <h2 id="manager-action-title" class="text-lg font-extrabold text-slate-800">Manager password required</h2>
@@ -4955,7 +5048,7 @@ HTML_TEMPLATE = """
                 <div class="bg-white p-6 rounded-2xl shadow-md border-2 border-amber-200">
                     <div class="mb-4">
                         <h2 class="text-xl font-bold text-slate-800">1B. Daily Price Update</h2>
-                        <p class="text-sm text-slate-500 mt-1">Manager daily file upload kare. Sirf file me diye hue non-empty prices update honge; baaki sab prices/details same rahenge.</p>
+                        <p class="text-sm text-slate-500 mt-1">Manager daily file upload kare. Existing Price 1–4 format ya Article Code, Article Name, EAN, UOM, Price wali row format use karein. Sirf uploaded non-empty prices update honge.</p>
                     </div>
                     <input type="file" id="price-excel-file" accept=".xlsx,.xls,.csv"
                         class="block w-full text-sm text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-amber-50 file:text-amber-800 border border-slate-200 rounded-xl p-1.5">
@@ -5835,6 +5928,57 @@ HTML_TEMPLATE = """
             </button>`;
         }
 
+        function renderUomPriceBox(price, index, item, statusId = 'print-status') {
+            const value = String(price.price || '').trim();
+            const payload = encodeURIComponent(JSON.stringify({
+                article_code: item.article_code || item.barcode,
+                item_name: displayArticleName(item.name),
+                price: value,
+                unit: price.uom,
+                price_type: price.price_type || 'uom',
+                ean_code: price.ean_code || '',
+                article_type: item.article_type || 'NORMAL'
+            }));
+            return `<button ${value ? `onclick="selectPricePrint('${payload}', '${statusId}')"` : 'disabled'} class="w-full min-w-0 ${value ? 'bg-emerald-50 border-emerald-400 hover:scale-[1.02] cursor-pointer' : 'bg-slate-50 border-slate-200 opacity-60'} border-2 rounded-2xl p-3 text-center shadow-sm transition sm:p-4">
+                <span class="text-xs font-extrabold uppercase tracking-wider block text-slate-600">Price ${index + 1}</span>
+                <span class="text-[11px] text-slate-500 block mb-1">${escapeHtml(price.uom)}${price.ean_code ? ` · EAN ${escapeHtml(price.ean_code)}` : ''}</span>
+                <span class="${value ? 'text-2xl sm:text-3xl font-black text-slate-900' : 'text-xl font-bold text-slate-400'} block mt-1 break-words">${escapeHtml(value || '--')}</span>
+                ${value ? '<span class="block mt-2 text-sm font-black text-indigo-700">🖨️ PRINT THIS PRICE</span>' : ''}
+            </button>`;
+        }
+
+        function showScannedEanPrice(items, query) {
+            const scannedValue = String(query || '').trim().toLowerCase();
+            const item = items.find(result =>
+                result.scanned_price
+                && String(result.scanned_price.ean_code || '').trim().toLowerCase() === scannedValue
+            );
+            if (!item) return;
+            const scannedPrice = item.scanned_price;
+            const payload = encodeURIComponent(JSON.stringify({
+                article_code: item.article_code || item.barcode,
+                item_name: displayArticleName(item.name),
+                price: scannedPrice.price,
+                unit: scannedPrice.uom,
+                price_type: 'uom',
+                ean_code: scannedPrice.ean_code,
+                article_type: item.article_type || 'NORMAL'
+            }));
+            document.getElementById('ean-price-details').innerHTML = `
+                <p class="break-all text-sm font-semibold text-slate-600">EAN: ${escapeHtml(scannedPrice.ean_code)}</p>
+                <p class="mt-1 break-words font-bold text-slate-800">${escapeHtml(displayArticleName(item.name))}</p>
+                <p class="mt-3 rounded-xl bg-indigo-50 p-4 text-center">
+                    <span class="block text-xs font-bold uppercase text-indigo-700">${escapeHtml(scannedPrice.uom)}</span>
+                    <span class="mt-1 block text-4xl font-black text-slate-900">${escapeHtml(scannedPrice.price)}</span>
+                </p>`;
+            document.getElementById('ean-price-print').onclick = () => {
+                document.getElementById('ean-price-dialog').close();
+                selectPricePrint(payload);
+            };
+            const dialog = document.getElementById('ean-price-dialog');
+            if (!dialog.open) dialog.showModal();
+        }
+
         let pendingPrintPayload = null;
         let pendingPrintStatusId = 'print-status';
         let selectedPrintFormat = null;
@@ -6031,10 +6175,14 @@ HTML_TEMPLATE = """
                     </div>
 
                     <div class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
-                        ${renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400', item, 'cx', statusId)}
-                        ${renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400', item, 'emb', statusId)}
-                        ${renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400', item, 'pc_kgm', statusId)}
-                        ${renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400', item, 'bag', statusId)}
+                        ${Array.isArray(item.uom_prices) && item.uom_prices.length
+                            ? item.uom_prices.map((price, index) => renderUomPriceBox(price, index, item, statusId)).join('')
+                            : [
+                                renderPriceBox('Price', '1', item.price_cx, 'bg-emerald-50 border-emerald-400', item, 'cx', statusId),
+                                renderPriceBox('Price', '2', item.price_emb, 'bg-blue-50 border-blue-400', item, 'emb', statusId),
+                                renderPriceBox('Price', '3', item.price_pc_kgm, 'bg-amber-50 border-amber-400', item, 'pc_kgm', statusId),
+                                renderPriceBox('Price', '4', item.price_bag, 'bg-purple-50 border-purple-400', item, 'bag', statusId)
+                            ].join('')}
                     </div>
                 </div>
             `).join('');
@@ -6056,6 +6204,7 @@ HTML_TEMPLATE = """
                 const localItems = await searchInLocalDB(query, physicalStockOnly);
                 if (searchRequests.get(resultBox) !== controller) return;
                 displaySearchResults(localItems, query, "⚡ Offline Local DB", resultBox);
+                if (!resultTarget) showScannedEanPrice(localItems, query);
                 if (!resultTarget) inputEl.select();
                 return;
             }
@@ -6077,12 +6226,14 @@ HTML_TEMPLATE = """
                 }
                 if (searchRequests.get(resultBox) !== controller) return;
                 displaySearchResults(data.items || [], query, "🟢 Online Live DB", resultBox);
+                if (!resultTarget) showScannedEanPrice(data.items || [], query);
                 if (!resultTarget) inputEl.select();
             } catch {
                 if (searchRequests.get(resultBox) !== controller) return;
                 const localItems = await searchInLocalDB(query, physicalStockOnly);
                 if (searchRequests.get(resultBox) !== controller) return;
                 displaySearchResults(localItems, query, "⚡ Offline Local DB", resultBox);
+                if (!resultTarget) showScannedEanPrice(localItems, query);
                 if (!resultTarget) inputEl.select();
             }
         }
@@ -6763,8 +6914,8 @@ HTML_TEMPLATE = """
                                 ${makeOptions(barcodeGuess, '-- Select Barcode Column --')}
                             </select>
                         </div>
-                        <div class="${isMaster || isSpecialUpload ? '' : 'hidden'}">
-                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">EAN / Barcode Column</label>
+                        <div class="${isMaster || isSpecialUpload || mode === 'price' ? '' : 'hidden'}">
+                            <label class="block text-xs font-bold uppercase text-slate-700 mb-1">EAN / Barcode Column ${mode === 'price' ? '(required for UOM prices)' : ''}</label>
                             <select class="col-ean w-full p-2.5 bg-white border-2 border-indigo-200 rounded-lg font-medium text-sm">
                                 ${makeOptions(eanGuess, '-- Optional EAN Column --')}
                             </select>
@@ -6813,6 +6964,22 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
 
+                    <div class="${mode === 'price' ? 'grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4 bg-amber-50 p-4 rounded-xl border border-amber-200' : 'hidden'}">
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-amber-800 mb-1">UOM Column (Optional)</label>
+                            <select class="col-uom w-full p-2 bg-white border border-amber-300 rounded-lg text-sm">
+                                ${makeOptions(guessColumn(tab.columns, ['uom', 'unit of measure']), '-- Use Price 1–4 columns --')}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-amber-800 mb-1">Single Price Column (Required with UOM)</label>
+                            <select class="col-single-price w-full p-2 bg-white border border-amber-300 rounded-lg text-sm">
+                                ${makeOptions(guessColumn(tab.columns, ['price', 'rate', 'selling']), '-- Select UOM price column --')}
+                            </select>
+                        </div>
+                        <p class="sm:col-span-2 text-xs text-amber-900">UOM price format: one row per EAN/UOM, with Article Code, Article Name, EAN, UOM, and Price columns. Leave UOM blank to use the existing Price 1–4 format.</p>
+                    </div>
+
                     <div class="mt-4 overflow-x-auto">
                         <p class="text-xs font-semibold text-slate-500 mb-1">Sample Preview (First 2 Rows):</p>
                         <table class="w-full text-xs text-left bg-white border border-slate-200 rounded-lg">
@@ -6847,9 +7014,19 @@ HTML_TEMPLATE = """
                 const pricePcCol = card.querySelector('.col-price-pc')?.value || '';
                 const priceBagCol = card.querySelector('.col-price-bag')?.value || '';
                 const articleTypeCol = card.querySelector('.col-article-type').value;
+                const uomCol = card.querySelector('.col-uom')?.value || '';
+                const singlePriceCol = card.querySelector('.col-single-price')?.value || '';
 
                 if (!barcodeCol) {
                     alert(`Please select ${currentUploadMode === "master" ? "Master Article Code" : "Article Code / EAN"} column for tab: "${sheetName}"`);
+                    return;
+                }
+                if (currentUploadMode === 'price' && Boolean(uomCol) !== Boolean(singlePriceCol)) {
+                    alert(`Select both UOM and Single Price columns (or leave both blank) for tab: "${sheetName}"`);
+                    return;
+                }
+                if (currentUploadMode === 'price' && uomCol && !eanCol) {
+                    alert(`Select the EAN / Barcode column for UOM price updates in tab: "${sheetName}"`);
                     return;
                 }
 
@@ -6862,7 +7039,9 @@ HTML_TEMPLATE = """
                     price_emb_col: priceEmbCol,
                     price_pc_col: pricePcCol,
                     price_bag_col: priceBagCol,
-                    article_type_col: articleTypeCol
+                    article_type_col: articleTypeCol,
+                    uom_col: uomCol,
+                    single_price_col: singlePriceCol
                 });
             }
 
@@ -7166,10 +7345,12 @@ def delete_data():
         with connect_db() as conn:
             if scope == "master":
                 conn.execute("DELETE FROM ean_aliases")
+                conn.execute("DELETE FROM article_prices")
                 conn.execute("DELETE FROM products")
                 conn.commit()
                 seed_builtin_master()
             elif scope == "price":
+                conn.execute("DELETE FROM article_prices")
                 conn.execute(
                     """UPDATE products SET price_cx='', price_emb='', price_pc_kgm='',
                               price_bag='', list_price='', updated_at=?""",
@@ -7350,6 +7531,7 @@ def api_sync_all():
                 item["article_code"] = item["barcode"]
                 item["barcode"] = item.pop("search_key")
                 items.append(item)
+        items = attach_uom_prices(conn, items)
     return jsonify({
         "success": True,
         "count": len(items),
@@ -7386,6 +7568,13 @@ def update_single():
             """,
                 (p_cx, p_emb, p_pc, p_bag, now_str, barcode),
             )
+            for uom, price in (
+                ("CX", p_cx), ("EMB", p_emb), ("UN", p_pc), ("BAG", p_bag)
+            ):
+                conn.execute(
+                    "UPDATE article_prices SET price=?, updated_at=? WHERE article_code=? AND uom=?",
+                    (price, now_str, barcode, uom),
+                )
             bump_catalog_revision(conn)
             conn.commit()
         return jsonify({"success": True})
@@ -7521,7 +7710,8 @@ def api_search():
                            LIMIT 15""",
                         (like_q, like_q),
                     ).fetchall()
-    items = [dict(r) for r in rows]
+    with connect_db() as conn:
+        items = attach_uom_prices(conn, rows, scanned_ean=q)
     return jsonify({"found": len(items) > 0, "items": items})
 
 
@@ -7539,7 +7729,8 @@ def api_articles():
                ORDER BY name, barcode""",
             (article_type,),
         ).fetchall()
-    return jsonify({"success": True, "count": len(rows), "items": [dict(row) for row in rows]})
+        items = attach_uom_prices(conn, rows)
+    return jsonify({"success": True, "count": len(items), "items": items})
 
 
 @app.route("/api/manager-products")
@@ -7632,22 +7823,68 @@ def create_print_job():
                     "success":False,
                     "error":"Power SKU and KVI articles can only be printed as NORMAL_QR or NORMAL_QR_S3 on EPSON",
                 }),400
-            price_columns = {
-                "cx": ("price_cx", "CX"),
-                "emb": ("price_emb", "EMB"),
-                "pc_kgm": ("price_pc_kgm", "UN"),
-                "bag": ("price_bag", "BAG"),
-            }
-            selected_price = price_columns.get(str(data.get("price_type", "")).strip())
-            if not selected_price:
-                return jsonify({"success":False,"error":"Unsupported price selection"}),400
-            selected_value = str(product[selected_price[0]] or "").strip()
-            if not selected_value:
-                return jsonify({"success":False,"error":"Selected daily price is missing for this article"}),400
+            if str(data.get("price_type", "")).strip() == "uom":
+                selected_uom = normalize_uom(data.get("unit", ""))
+                selected_ean = str(data.get("ean_code", "")).strip()
+                selected_price = conn.execute(
+                    """SELECT price, uom FROM article_prices
+                       WHERE article_code=? AND uom=? AND price=?
+                         AND (ean_code=? OR ean_code='')
+                       ORDER BY CASE WHEN ean_code=? THEN 0 ELSE 1 END
+                       LIMIT 1""",
+                    (
+                        article_code,
+                        selected_uom,
+                        str(data.get("price", "")).strip(),
+                        selected_ean,
+                        selected_ean,
+                    ),
+                ).fetchone()
+                if not selected_price:
+                    return jsonify({"success":False,"error":"Selected daily price is missing for this article"}),400
+                selected_value = selected_price["price"]
+                selected_unit = selected_price["uom"]
+            else:
+                price_columns = {
+                    "cx": ("price_cx", "CX"),
+                    "emb": ("price_emb", "EMB"),
+                    "pc_kgm": ("price_pc_kgm", "UN"),
+                    "bag": ("price_bag", "BAG"),
+                }
+                selected_price = price_columns.get(str(data.get("price_type", "")).strip())
+                if not selected_price:
+                    return jsonify({"success":False,"error":"Unsupported price selection"}),400
+                selected_value = str(product[selected_price[0]] or "").strip()
+                selected_unit = selected_price[1]
+                if not selected_value:
+                    return jsonify({"success":False,"error":"Selected daily price is missing for this article"}),400
             data["article_code"] = product["barcode"]
             data["item_name"] = product["name"]
             data["price"] = selected_value
-            data["unit"] = selected_price[1]
+            data["unit"] = selected_unit
+        elif str(data.get("price_type", "")).strip() == "uom":
+            selected_uom = normalize_uom(data.get("unit", ""))
+            selected_ean = str(data.get("ean_code", "")).strip()
+            selected_price = conn.execute(
+                """SELECT price, uom FROM article_prices
+                   WHERE article_code=? AND uom=? AND price=?
+                     AND (ean_code=? OR ean_code='')
+                   ORDER BY CASE WHEN ean_code=? THEN 0 ELSE 1 END
+                   LIMIT 1""",
+                (
+                    article_code,
+                    selected_uom,
+                    str(data.get("price", "")).strip(),
+                    selected_ean,
+                    selected_ean,
+                ),
+            ).fetchone()
+            if not selected_price:
+                return jsonify({"success":False,"error":"Selected daily price is missing for this article"}),400
+            data["article_code"] = product["barcode"] if product else article_code
+            data["item_name"] = product["name"] if product else data["item_name"]
+            data["price"] = selected_price["price"]
+            data["unit"] = selected_price["uom"]
         elif print_format in qr_formats:
             return jsonify({"success":False,"error":"QR formats are reserved for Power SKU and KVI articles"}),400
 
@@ -7901,6 +8138,8 @@ def import_mapped():
                 pc_col = m.get("price_pc_col", "")
                 bag_col = m.get("price_bag_col", "")
                 article_type_col = m.get("article_type_col", "")
+                uom_col = m.get("uom_col", "")
+                single_price_col = m.get("single_price_col", "")
                 df = pd.read_csv(filepath, dtype=str) if ext == ".csv" else pd.read_excel(filepath, sheet_name=sheet, dtype=str)
                 df = df.dropna(how="all")
 
@@ -7924,6 +8163,8 @@ def import_mapped():
                         "name": name,
                         "prices": prices,
                         "eans": split_eans(row.get(ean_col)) if ean_col else [],
+                        "uom": normalize_uom(row.get(uom_col)) if uom_col else "",
+                        "single_price": format_price(row.get(single_price_col)) if single_price_col else "",
                         "article_type": article_type,
                         "article_type_provided": bool(default_article_type or raw_article_type),
                     })
@@ -7986,6 +8227,92 @@ def import_mapped():
                     continue
 
                 if import_mode == "price":
+                    if bool(uom_col) != bool(single_price_col):
+                        raise ValueError("Select both UOM and Single Price columns for UOM price updates.")
+                    if uom_col and single_price_col:
+                        if not ean_col:
+                            raise ValueError("Select an EAN / Barcode column for UOM price updates.")
+                        alias_rows = find_values(
+                            "SELECT ean_code, article_code FROM ean_aliases WHERE ean_code IN",
+                            [record["code"] for record in records],
+                        )
+                        aliases_by_ean = {
+                            row["ean_code"]: row["article_code"] for row in alias_rows
+                        }
+                        for record in records:
+                            record["article_code"] = aliases_by_ean.get(
+                                record["code"], record["code"]
+                            )
+
+                        existing_rows = find_values(
+                            "SELECT barcode FROM products WHERE barcode IN",
+                            [record["article_code"] for record in records],
+                        )
+                        existing_codes = {row["barcode"] for row in existing_rows}
+                        price_rows = []
+                        alias_updates = []
+                        name_updates = []
+                        legacy_price_fields = {
+                            "CX": "price_cx",
+                            "EMB": "price_emb",
+                            "UN": "price_pc_kgm",
+                            "BAG": "price_bag",
+                        }
+                        legacy_updates = []
+                        for record in records:
+                            article_code = record["article_code"]
+                            uom = record["uom"]
+                            price = record["single_price"]
+                            if article_code not in existing_codes or not uom or not price:
+                                skipped += 1
+                                continue
+                            eans = list(dict.fromkeys(record["eans"]))
+                            if record["code"] != article_code and not eans:
+                                eans = [record["code"]]
+                            ean_codes = eans or [""]
+                            price_rows.extend(
+                                (article_code, ean, uom, price, now_str)
+                                for ean in ean_codes
+                            )
+                            alias_updates.extend(
+                                (ean, article_code, now_str) for ean in eans
+                            )
+                            if record["name"]:
+                                name_updates.append((record["name"], now_str, article_code))
+                            legacy_field = legacy_price_fields.get(uom)
+                            if legacy_field:
+                                legacy_updates.append(
+                                    (price, now_str, article_code, legacy_field)
+                                )
+                            existing_updated += 1
+
+                        conn.executemany(
+                            """INSERT INTO article_prices
+                                 (article_code,ean_code,uom,price,updated_at)
+                               VALUES(?,?,?,?,?)
+                               ON CONFLICT(article_code,ean_code,uom) DO UPDATE SET
+                                 price=excluded.price, updated_at=excluded.updated_at""",
+                            price_rows,
+                        )
+                        conn.executemany(
+                            """INSERT INTO ean_aliases(ean_code,article_code,created_at)
+                               VALUES(?,?,?)
+                               ON CONFLICT(ean_code) DO UPDATE SET
+                                 article_code=excluded.article_code""",
+                            alias_updates,
+                        )
+                        conn.executemany(
+                            "UPDATE products SET name=?, updated_at=? WHERE barcode=?",
+                            name_updates,
+                        )
+                        for price, updated_at, article_code, legacy_field in legacy_updates:
+                            conn.execute(
+                                f"UPDATE products SET {legacy_field}=?, updated_at=? WHERE barcode=?",
+                                (price, updated_at, article_code),
+                            )
+                        ean_linked += len(alias_updates)
+                        continue
+
                     alias_rows = find_values(
                         "SELECT ean_code, article_code FROM ean_aliases WHERE ean_code IN",
                         [record["code"] for record in records],
@@ -8029,6 +8356,17 @@ def import_mapped():
                     """
                     for batch in chunks(updates):
                         conn.executemany(update_sql, batch)
+                    for update in updates:
+                        for uom, price in zip(
+                            ("CX", "EMB", "UN", "BAG"),
+                            (update[0], update[2], update[4], update[6]),
+                        ):
+                            if price:
+                                conn.execute(
+                                    """UPDATE article_prices SET price=?, updated_at=?
+                                       WHERE article_code=? AND uom=?""",
+                                    (price, now_str, update[-1], uom),
+                                )
                     continue
 
                 article_codes = [record["code"] for record in records]
