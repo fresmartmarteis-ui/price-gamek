@@ -42,9 +42,17 @@ imported data can be lost when the serverless instance is replaced.
    `ean_aliases`, and `print_jobs` tables and seeds the bundled master data.
    Imported products, prices, aliases, and print jobs are then saved in
    Supabase and survive Vercel cold starts and redeployments.
-5. Visit `/api/health`; it should return HTTP 200 with `"database": "postgres"`
-   and `"storage": "external"`. A missing or unreachable database returns an
-   error instead of reporting healthy temporary storage.
+5. Create a **private** bucket named `uploads` in Supabase Storage (or choose a
+   different bucket name), then add these Vercel environment variables:
+   - `SUPABASE_URL`: the Supabase project URL.
+   - `SUPABASE_SERVICE_ROLE_KEY`: the server-side service role key. Keep it
+     private; never expose it to browser code or commit it.
+   - `SUPABASE_STORAGE_BUCKET`: `uploads` (optional if using that default).
+   Add them to every environment where file uploads are enabled.
+6. Redeploy and visit `/api/health`; it should return HTTP 200 with
+   `"database": "postgres"` and `"storage": "supabase"`. A missing or
+   unreachable database or missing Storage configuration returns an error
+   instead of reporting healthy temporary storage.
 
 When `DATABASE_URL` is set but the database connection fails, the app reports
 the database error rather than switching to temporary SQLite.
@@ -61,8 +69,13 @@ Vercel `/tmp` database may already have been discarded by a cold start or
 redeploy, so export it before changing deployments if it is still available.
 
 Without `DATABASE_URL`, local development continues to use `store_prices.db`.
-The original uploaded Excel/CSV file is temporary and is deleted after a
-successful import; the records imported from it are persistent in Supabase.
+Configure the same Supabase Storage variables locally to retain uploaded source
+files there. On Vercel, Excel/CSV preview uploads and system-stock uploads are
+archived in the private bucket. Excel/CSV imports read the source file back from
+Storage, so they continue to work across serverless instances. The temporary
+local copy is removed after a successful import; the archived original remains
+in the bucket until it is deleted there. Stock uploads also return their Storage
+object key as `file_key` in the API response.
 
 ### System stock and manager password
 
@@ -172,6 +185,12 @@ for retry if the device is offline.
 Clicking the same category button again closes its list, while normal price search
 results appear directly beneath the search box. The category lists are also
 available offline after the catalog has synced to the device.
+
+The **Update Status** drawer in the portal shows the latest successful Price,
+EAN, Power SKU, and KVI SKU change. Timestamps are stored with the portal database
+and displayed in the viewer's local time. Historical changes from before this
+feature was deployed are not available; tracking starts with subsequent imports,
+manual price edits, and data deletions.
 
 The offline catalog is checked for a revision every minute; unchanged catalogs
 return a small response instead of downloading every article and EAN again. The

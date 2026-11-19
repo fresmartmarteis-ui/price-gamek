@@ -1,19 +1,21 @@
 import os
 import uuid
 import sqlite3
+import io
 import csv
 import re
 import hmac
 import math
 import hashlib
 import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, Response
 import pandas as pd
-import os
 
 app = Flask(__name__)
-BUCKET_NAME = os.environ.get("B2_BUCKET_NAME")
 
 # Vercel Functions have a read-only application filesystem. Temporary writes
 # must go under /tmp. These paths also continue to work locally.
@@ -23,6 +25,9 @@ UPLOAD_FOLDER = os.path.join(RUNTIME_DIR, "store_price_uploads")
 DB_NAME = os.path.join(RUNTIME_DIR, "store_prices.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "uploads").strip()
 EMPLOYEE_PASSWORD = os.getenv("EMPLOYEE_PASSWORD", "123").strip()
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "2026").strip()
 DEVELOPER_INITIAL_PASSWORD = os.getenv("DEVELOPER_INITIAL_PASSWORD", "").strip()
@@ -33,6 +38,63 @@ PASSWORD_HASH_ITERATIONS = 260_000
 if not EMPLOYEE_PASSWORD or not MANAGER_PASSWORD:
     raise RuntimeError("EMPLOYEE_PASSWORD and MANAGER_PASSWORD must not be empty.")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+def supabase_storage_enabled():
+    has_url = bool(SUPABASE_URL)
+    has_key = bool(SUPABASE_SERVICE_ROLE_KEY)
+    if has_url != has_key:
+        raise RuntimeError(
+            "Configure both SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for file storage."
+        )
+    if not has_url and IS_VERCEL:
+        raise RuntimeError(
+            "Supabase Storage is required on Vercel. Configure "
+            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+        )
+    if has_url and not SUPABASE_STORAGE_BUCKET:
+        raise RuntimeError("SUPABASE_STORAGE_BUCKET must not be empty.")
+    return has_url
+
+
+def supabase_storage_request(method, object_key, body=None, content_type=None):
+    bucket = urllib.parse.quote(SUPABASE_STORAGE_BUCKET, safe="")
+    key = urllib.parse.quote(object_key, safe="/")
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{key}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if method == "POST":
+        headers["x-upsert"] = "false"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Supabase Storage request failed with HTTP {exc.code}."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Unable to connect to Supabase Storage.") from exc
+
+
+def archive_uploaded_file(object_key, file_bytes, content_type):
+    if not supabase_storage_enabled():
+        return False
+    supabase_storage_request("POST", object_key, file_bytes, content_type)
+    return True
+
+
+def restore_uploaded_file(object_key, local_path):
+    if not supabase_storage_enabled():
+        return os.path.isfile(local_path)
+    file_bytes = supabase_storage_request("GET", object_key)
+    with open(local_path, "wb") as saved_file:
+        saved_file.write(file_bytes)
+    return True
 
 
 class DatabaseConnection:
@@ -178,6 +240,15 @@ def bump_catalog_revision(conn):
     )
 
 
+def record_data_update(conn, category, updated_at=None):
+    timestamp = updated_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO data_update_status(category, updated_at) VALUES(?,?)
+           ON CONFLICT(category) DO UPDATE SET updated_at=excluded.updated_at""",
+        (category, timestamp),
+    )
+
+
 def normalize_uom(value):
     uom = clean_barcode(value).upper()
     return {
@@ -258,6 +329,12 @@ def init_db():
             "INSERT INTO catalog_meta(key,value) VALUES('revision','1') "
             "ON CONFLICT(key) DO NOTHING"
         )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS data_update_status (
+                category TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 barcode TEXT PRIMARY KEY,
@@ -4850,7 +4927,33 @@ HTML_TEMPLATE = """
                 <button type="button" onclick="submitFirstPasswordChange()" class="login-submit">Save new password</button>
             </div>
             <p class="login-security-note">🔒 Your access is protected</p>
+            <p class="mt-4 border-t border-slate-200 pt-4 text-center text-xs font-semibold text-slate-500">
+                Portal developed by Mr. Sonu (NCSA0608)
+            </p>
         </div>
+    </div>
+
+    <div id="update-status-overlay" class="fixed inset-0 z-40 hidden" aria-hidden="true">
+        <button type="button" class="absolute inset-0 h-full w-full bg-slate-950/40"
+            aria-label="Close update status" onclick="closeUpdateStatus()"></button>
+        <aside class="absolute right-0 top-0 h-full w-full max-w-sm overflow-y-auto border-l border-slate-200 bg-white p-5 shadow-2xl"
+            aria-labelledby="update-status-title">
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <h2 id="update-status-title" class="text-lg font-extrabold text-slate-800">Data Update Status</h2>
+                    <p class="mt-1 text-xs text-slate-500">Most recent successful update time</p>
+                </div>
+                <button type="button" onclick="closeUpdateStatus()"
+                    class="rounded-lg px-3 py-1 text-lg font-bold text-slate-500 hover:bg-slate-100"
+                    aria-label="Close update status">✕</button>
+            </div>
+            <div id="update-status-list" class="mt-5 space-y-3" aria-live="polite">
+                <p class="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">Loading update status...</p>
+            </div>
+            <p class="mt-5 text-xs leading-5 text-slate-500">
+                Purane records ki update history available nahi hai. Status tracking ab se hone wale updates ke liye hai.
+            </p>
+        </aside>
     </div>
 
     <!-- ================= TOP NAVIGATION ================= -->
@@ -4871,6 +4974,10 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="flex items-center space-x-2">
+                <button onclick="openUpdateStatus()" id="btn-update-status"
+                    class="px-3 py-1.5 rounded-lg text-sm font-medium bg-indigo-800 hover:bg-indigo-600 text-white">
+                    📊 Update Status
+                </button>
                 <button id="btn-install-app" onclick="installPWA()" class="hidden px-3 py-1.5 rounded-lg text-sm font-bold bg-emerald-500 hover:bg-emerald-600 text-white shadow-md flex items-center gap-1">
                     📱 Install App
                 </button>
@@ -5600,8 +5707,59 @@ HTML_TEMPLATE = """
             badge.classList.remove('hidden');
         }
 
+        function closeUpdateStatus() {
+            const overlay = document.getElementById('update-status-overlay');
+            overlay.classList.add('hidden');
+            overlay.setAttribute('aria-hidden', 'true');
+        }
+
+        async function openUpdateStatus() {
+            const overlay = document.getElementById('update-status-overlay');
+            overlay.classList.remove('hidden');
+            overlay.setAttribute('aria-hidden', 'false');
+            await loadUpdateStatus();
+        }
+
+        async function loadUpdateStatus() {
+            const list = document.getElementById('update-status-list');
+            list.textContent = 'Loading update status...';
+            try {
+                const response = await fetch('/api/update-status');
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || 'Unable to load update status.');
+                }
+
+                const labels = [
+                    ['price', 'Price'],
+                    ['ean', 'EAN'],
+                    ['power_sku', 'Power SKU'],
+                    ['kvi', 'KVI SKU']
+                ];
+                list.replaceChildren();
+                for (const [key, label] of labels) {
+                    const card = document.createElement('div');
+                    card.className = 'rounded-xl border border-slate-200 bg-slate-50 p-4';
+                    const heading = document.createElement('h3');
+                    heading.className = 'text-sm font-bold text-slate-700';
+                    heading.textContent = label;
+                    const timestamp = document.createElement('p');
+                    timestamp.className = 'mt-1 text-sm text-slate-600';
+                    const updatedAt = data.updates?.[key];
+                    timestamp.textContent = updatedAt
+                        ? new Date(updatedAt).toLocaleString()
+                        : 'No update recorded yet';
+                    card.append(heading, timestamp);
+                    list.append(card);
+                }
+            } catch (error) {
+                list.textContent = error.message || 'Unable to load update status.';
+            }
+        }
+
         function logoutPortal() {
             stopCamera();
+            closeUpdateStatus();
             fetch('/api/logout', {method: 'POST'}).catch(error => {
                 console.warn('Unable to close portal session:', error);
             });
@@ -7367,6 +7525,15 @@ def delete_data():
             else:
                 conn.execute("DELETE FROM system_stock")
                 bump_catalog_revision(conn)
+            affected_categories = (
+                ("price", "ean", "power_sku", "kvi")
+                if scope == "master"
+                else (scope,)
+                if scope in {"price", "power_sku", "kvi"}
+                else ()
+            )
+            for category in affected_categories:
+                record_data_update(conn, category)
             conn.commit()
         return jsonify({"success": True, "message": messages[scope]})
     except Exception as exc:
@@ -7381,11 +7548,12 @@ def upload_system_stock():
         return jsonify({"success": False, "error": "Select an Excel or CSV file first."}), 400
 
     extension = os.path.splitext(uploaded_file.filename)[1].lower()
+    file_bytes = uploaded_file.read()
     try:
         if extension == ".csv":
-            frame = pd.read_csv(uploaded_file, dtype=str, encoding="utf-8-sig")
+            frame = pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="utf-8-sig")
         elif extension in {".xlsx", ".xls"}:
-            frame = pd.read_excel(uploaded_file, dtype=str)
+            frame = pd.read_excel(io.BytesIO(file_bytes), dtype=str)
         else:
             return jsonify({
                 "success": False,
@@ -7444,6 +7612,17 @@ def upload_system_stock():
     if not records_by_code:
         return jsonify({"success": False, "error": "The file contains no stock rows."}), 400
 
+    file_key = f"{uuid.uuid4().hex}{extension}"
+    try:
+        archived = archive_uploaded_file(
+            file_key,
+            file_bytes,
+            uploaded_file.mimetype or "application/octet-stream",
+        )
+    except RuntimeError as exc:
+        app.logger.exception("Unable to archive system-stock upload in Supabase Storage")
+        return jsonify({"success": False, "error": str(exc)}), 502
+
     now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
     try:
         with connect_db() as conn:
@@ -7461,6 +7640,7 @@ def upload_system_stock():
     return jsonify({
         "success": True,
         "uploaded": len(records_by_code),
+        "file_key": file_key if archived else None,
         "message": f"System stock updated for {len(records_by_code)} articles.",
     })
 
@@ -7556,7 +7736,7 @@ def update_single():
 
     try:
         with connect_db() as conn:
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE products SET
                     price_cx = ?,
@@ -7568,13 +7748,15 @@ def update_single():
             """,
                 (p_cx, p_emb, p_pc, p_bag, now_str, barcode),
             )
-            for uom, price in (
-                ("CX", p_cx), ("EMB", p_emb), ("UN", p_pc), ("BAG", p_bag)
-            ):
-                conn.execute(
-                    "UPDATE article_prices SET price=?, updated_at=? WHERE article_code=? AND uom=?",
-                    (price, now_str, barcode, uom),
-                )
+            if result.rowcount:
+                for uom, price in (
+                    ("CX", p_cx), ("EMB", p_emb), ("UN", p_pc), ("BAG", p_bag)
+                ):
+                    conn.execute(
+                        "UPDATE article_prices SET price=?, updated_at=? WHERE article_code=? AND uom=?",
+                        (price, now_str, barcode, uom),
+                    )
+                record_data_update(conn, "price")
             bump_catalog_revision(conn)
             conn.commit()
         return jsonify({"success": True})
@@ -7969,6 +8151,16 @@ def preview_excel():
         return jsonify({"success": False, "error": "Empty filename"})
 
     ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in {".csv", ".xlsx", ".xls"}:
+        return jsonify({
+            "success": False,
+            "error": "Unsupported file type. Upload an .xlsx, .xls, or .csv file.",
+        }), 400
+    try:
+        supabase_storage_enabled()
+    except RuntimeError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+
     temp_filename = f"{uuid.uuid4().hex}{ext}"
     filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
     f.save(filepath)
@@ -8063,11 +8255,21 @@ def preview_excel():
                 "error": "No valid data tabs found in the file.",
             })
 
+        with open(filepath, "rb") as uploaded_file:
+            archive_uploaded_file(
+                temp_filename,
+                uploaded_file.read(),
+                f.mimetype or "application/octet-stream",
+            )
+
         return jsonify({
             "success": True,
             "temp_filename": temp_filename,
             "tabs": tabs_info,
         })
+    except RuntimeError as e:
+        app.logger.exception("Unable to archive upload in Supabase Storage")
+        return jsonify({"success": False, "error": str(e)}), 502
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
@@ -8093,16 +8295,26 @@ def import_mapped():
             return jsonify({"success": False, "error": "Upload category does not match import mode"}), 400
         special_article_type = expected_type
 
-    # Prevent path traversal: browser may only reference a generated temp filename.
-    temp_filename = os.path.basename(temp_filename)
+    # Upload keys are generated UUID filenames; reject any path components.
+    if os.path.basename(temp_filename) != temp_filename:
+        return jsonify({"success": False, "error": "Invalid uploaded file reference."}), 400
+    if not re.fullmatch(r"[a-f0-9]{32}\.(csv|xlsx|xls)", temp_filename):
+        return jsonify({"success": False, "error": "Invalid uploaded file reference."}), 400
     filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
-    if not os.path.exists(filepath):
+    try:
+        file_restored = restore_uploaded_file(temp_filename, filepath)
+    except RuntimeError as exc:
+        app.logger.exception("Unable to retrieve upload from Supabase Storage")
+        return jsonify({"success": False, "error": str(exc)}), 502
+    if not file_restored:
         return jsonify({"success": False, "error": "Temporary file expired. Please upload again."}), 400
 
     ext = os.path.splitext(filepath)[1].lower()
     now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
+    status_updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     new_added = existing_updated = ean_linked = skipped = 0
     special_upload_replaced = False
+    updated_categories = set()
 
     def split_eans(value):
         """Supports one EAN, multiple rows, or comma/semicolon/pipe/newline separated EANs."""
@@ -8223,6 +8435,9 @@ def import_mapped():
                                article_code=excluded.article_code""",
                             batch,
                         )
+                    updated_categories.add(special_article_type.lower())
+                    if alias_updates:
+                        updated_categories.add("ean")
                     existing_updated += len(matched_records)
                     continue
 
@@ -8301,6 +8516,10 @@ def import_mapped():
                                  article_code=excluded.article_code""",
                             alias_updates,
                         )
+                        if price_rows:
+                            updated_categories.add("price")
+                        if alias_updates:
+                            updated_categories.add("ean")
                         conn.executemany(
                             "UPDATE products SET name=?, updated_at=? WHERE barcode=?",
                             name_updates,
@@ -8356,6 +8575,8 @@ def import_mapped():
                     """
                     for batch in chunks(updates):
                         conn.executemany(update_sql, batch)
+                    if updates:
+                        updated_categories.add("price")
                     for update in updates:
                         for uom, price in zip(
                             ("CX", "EMB", "UN", "BAG"),
@@ -8396,6 +8617,10 @@ def import_mapped():
                     else:
                         new_added += 1
                         known_codes.add(article_code)
+                    if any(prices.values()):
+                        updated_categories.add("price")
+                    if record["article_type"] in {"POWER_SKU", "KVI"}:
+                        updated_categories.add(record["article_type"].lower())
 
                     for ean in dict.fromkeys([article_code, *record["eans"]]):
                         if ean:
@@ -8428,11 +8653,15 @@ def import_mapped():
                     conn.executemany(product_sql, batch)
                 for batch in chunks(alias_rows):
                     conn.executemany(alias_sql, batch)
+                if alias_rows:
+                    updated_categories.add("ean")
 
             if import_mode in ("power_sku", "kvi") and not special_upload_replaced:
                 raise ValueError(
                     f"No {special_article_type.replace('_', ' ')} articles matched the existing catalog; existing category list was not changed."
                 )
+            for category in updated_categories:
+                record_data_update(conn, category, status_updated_at)
             bump_catalog_revision(conn)
             conn.commit()
             total_products = conn.execute(
@@ -8455,7 +8684,11 @@ def health():
         "ok": True,
         "platform": "vercel" if IS_VERCEL else "local",
         "database": "postgres" if USE_POSTGRES else DB_NAME,
-        "storage": "external" if USE_POSTGRES else ("temporary" if IS_VERCEL else "local")
+        "storage": (
+            "supabase"
+            if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+            else ("unconfigured" if IS_VERCEL else "local")
+        ),
     }
     try:
         with connect_db() as conn:
@@ -8465,7 +8698,29 @@ def health():
         health_data["ok"] = False
         health_data["error"] = "Database connection failed"
         return jsonify(health_data), 503
+    try:
+        supabase_storage_enabled()
+    except RuntimeError as exc:
+        health_data["ok"] = False
+        health_data["error"] = str(exc)
+        return jsonify(health_data), 503
     return jsonify(health_data)
+
+
+@app.route("/api/update-status")
+def api_update_status():
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT category, updated_at FROM data_update_status"
+        ).fetchall()
+    updates = {row["category"]: row["updated_at"] for row in rows}
+    return jsonify({
+        "success": True,
+        "updates": {
+            category: updates.get(category)
+            for category in ("price", "ean", "power_sku", "kvi")
+        },
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
