@@ -4610,7 +4610,11 @@ def seed_builtin_master():
         alias_result = conn.executemany(
             """INSERT INTO ean_aliases(ean_code,article_code,created_at) VALUES(?,?,?)
                ON CONFLICT(ean_code) DO UPDATE SET article_code=excluded.article_code
-               WHERE ean_aliases.article_code<>excluded.article_code""",
+               WHERE ean_aliases.article_code<>excluded.article_code
+                 AND NOT EXISTS (
+                     SELECT 1 FROM article_prices
+                     WHERE article_prices.ean_code=excluded.ean_code
+                 )""",
             aliases,
         )
         if product_result.rowcount or alias_result.rowcount:
@@ -4625,6 +4629,98 @@ def clean_barcode(val):
     if s.endswith(".0"):
         s = s[:-2]
     return s
+
+
+def seed_bundled_uom_prices():
+    workbook_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data",
+        "price_uom_master.xlsx",
+    )
+    with connect_db() as conn:
+        seeded = conn.execute(
+            "SELECT value FROM catalog_meta WHERE key='bundled_uom_master_seed'"
+        ).fetchone()
+        if seeded:
+            return
+
+    if not os.path.isfile(workbook_path):
+        raise RuntimeError(f"Bundled UOM master workbook is missing: {workbook_path}")
+
+    dataframe = pd.read_excel(workbook_path, dtype=object)
+    columns = {str(column).strip().upper(): column for column in dataframe.columns}
+    required_columns = {"EANCODE", "ITEM CODE", "ITEM NAME", "UOM", "PRICE"}
+    missing_columns = required_columns - columns.keys()
+    if missing_columns:
+        raise RuntimeError(
+            "Bundled UOM master workbook is missing columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
+    products_by_code = {}
+    aliases_by_ean = {}
+    price_rows = []
+    for _, row in dataframe.iterrows():
+        article_code = clean_barcode(row[columns["ITEM CODE"]])
+        if not article_code:
+            continue
+
+        article_name = normalize_article_name(clean_barcode(row[columns["ITEM NAME"]]))
+        products_by_code.setdefault(
+            article_code,
+            (
+                article_code,
+                article_name or article_code,
+                "",
+                "",
+                "",
+                "",
+                now_str,
+            ),
+        )
+
+        ean_code = clean_barcode(row[columns["EANCODE"]])
+        if ean_code:
+            aliases_by_ean.setdefault(ean_code, (ean_code, article_code, now_str))
+
+        uom = normalize_uom(row[columns["UOM"]])
+        price = format_price(row[columns["PRICE"]])
+        if uom and price:
+            price_rows.append((article_code, ean_code, uom, price, now_str))
+
+    with connect_db() as conn:
+        if not USE_POSTGRES:
+            conn.execute("PRAGMA foreign_keys = ON")
+        for start in range(0, len(products_by_code), 500):
+            conn.executemany(
+                """INSERT INTO products
+                   (barcode,name,price_cx,price_emb,price_pc_kgm,price_bag,updated_at)
+                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(barcode) DO NOTHING""",
+                list(products_by_code.values())[start:start + 500],
+            )
+        for start in range(0, len(aliases_by_ean), 500):
+            conn.executemany(
+                """INSERT INTO ean_aliases(ean_code,article_code,created_at)
+                   VALUES(?,?,?) ON CONFLICT(ean_code) DO UPDATE SET
+                   article_code=excluded.article_code
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM article_prices
+                       WHERE article_prices.ean_code=excluded.ean_code
+                   )""",
+                list(aliases_by_ean.values())[start:start + 500],
+            )
+        for start in range(0, len(price_rows), 500):
+            conn.executemany(
+                """INSERT INTO article_prices
+                     (article_code,ean_code,uom,price,updated_at)
+                   VALUES(?,?,?,?,?) ON CONFLICT(article_code,ean_code,uom) DO NOTHING""",
+                price_rows[start:start + 500],
+            )
+        conn.execute(
+            "INSERT INTO catalog_meta(key,value) VALUES('bundled_uom_master_seed','1')"
+        )
+        bump_catalog_revision(conn)
 
 
 def normalize_article_type(value):
@@ -4655,6 +4751,7 @@ def format_price(val):
 
 
 seed_builtin_master()
+seed_bundled_uom_prices()
 
 # --- PWA MANIFEST JSON ---
 MANIFEST_JSON = """
@@ -5155,7 +5252,7 @@ HTML_TEMPLATE = """
                 <div class="bg-white p-6 rounded-2xl shadow-md border-2 border-amber-200">
                     <div class="mb-4">
                         <h2 class="text-xl font-bold text-slate-800">1B. Daily Price Update</h2>
-                        <p class="text-sm text-slate-500 mt-1">Manager daily file upload kare. Existing Price 1–4 format ya Article Code, Article Name, EAN, UOM, Price wali row format use karein. Sirf uploaded non-empty prices update honge.</p>
+                        <p class="text-sm text-slate-500 mt-1">Bundled UOM master prices pehle se available hain, chahe daily file upload na ho. Manager daily file se existing Price 1–4 format ya Article Code, Article Name, EAN, UOM, Price wali row format update kar sakta hai; uploaded non-empty prices hi update honge.</p>
                     </div>
                     <input type="file" id="price-excel-file" accept=".xlsx,.xls,.csv"
                         class="block w-full text-sm text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-amber-50 file:text-amber-800 border border-slate-200 rounded-xl p-1.5">
@@ -6124,6 +6221,7 @@ HTML_TEMPLATE = """
             }));
             document.getElementById('ean-price-details').innerHTML = `
                 <p class="break-all text-sm font-semibold text-slate-600">EAN: ${escapeHtml(scannedPrice.ean_code)}</p>
+                <p class="mt-1 break-all text-sm font-semibold text-slate-600">Article Code: ${escapeHtml(item.article_code || item.barcode)}</p>
                 <p class="mt-1 break-words font-bold text-slate-800">${escapeHtml(displayArticleName(item.name))}</p>
                 <p class="mt-3 rounded-xl bg-indigo-50 p-4 text-center">
                     <span class="block text-xs font-bold uppercase text-indigo-700">${escapeHtml(scannedPrice.uom)}</span>

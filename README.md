@@ -88,13 +88,15 @@ system quantity greater than zero; with the checkbox off, search includes the
 full catalog and stock-uploaded articles. The uploaded stock quantity is also
 available when the offline catalog has synced.
 
+The bundled `data/price_uom_master.xlsx` UOM master is seeded automatically,
+so its articles and prices are available even before a daily file is uploaded.
 Daily Price Update accepts the existing four-price format or a row-per-price
 format with `EAN`, `Article Code`, `Article Name`, `UOM`, and `Price` columns.
 For the row format, map the article code, optional EAN/name, UOM, and single
 price columns in the import screen. UOM values are retained per article and
-EAN; scanning a matching EAN opens its UOM price and print action, while the
-scanner result below shows all available UOM prices for the article. Synced
-UOM prices are also available offline.
+EAN; scanning a matching EAN opens its UOM, price, and print action, while
+closing the popup leaves all available UOM prices numbered below the scanner.
+Synced UOM prices are also available offline.
 
 The manager password is checked by the server before any delete action. Set a
 private `MANAGER_PASSWORD` environment variable in Vercel and local
