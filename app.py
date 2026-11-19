@@ -175,6 +175,17 @@ def verify_password(password, encoded_hash):
         return False
 
 
+def verify_manager_password(password):
+    with connect_db() as conn:
+        setting = conn.execute(
+            "SELECT setting_value FROM portal_settings WHERE setting_key=?",
+            ("manager_password_hash",),
+        ).fetchone()
+    if setting:
+        return verify_password(password, setting["setting_value"])
+    return hmac.compare_digest(password, MANAGER_PASSWORD)
+
+
 def create_portal_session(conn, username):
     token = secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
@@ -506,6 +517,13 @@ def init_db():
                 must_change_password INTEGER NOT NULL DEFAULT 1,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS portal_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
@@ -5212,13 +5230,28 @@ HTML_TEMPLATE = """
         <div id="view-employees" class="hidden space-y-6">
             <div class="rounded-2xl border border-indigo-200 bg-white p-6 shadow-md">
                 <h2 class="text-xl font-bold text-slate-800">Employee Account Management</h2>
-                <p class="mt-1 text-sm text-slate-600">Employee IDs aur password reset hi manage kar sakte hain. Existing passwords kabhi display nahi hote; temporary password reset ke baad ek baar dikhaya jayega. Employee ko first login par password change karna hoga.</p>
+                <p class="mt-1 text-sm text-slate-600">Employee IDs, password reset, aur manager login password manage kar sakte hain. Isse developer ko Manager Panel ka access nahi milta. Existing passwords kabhi display nahi hote; temporary password reset ke baad ek baar dikhaya jayega. Employee ko first login par password change karna hoga.</p>
                 <form id="create-employee-form" class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[1fr_auto]" onsubmit="event.preventDefault(); createEmployeeAccount();">
                     <label class="sr-only" for="new-employee-id">New employee ID</label>
                     <input id="new-employee-id" required maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,39}" autocomplete="off"
                         placeholder="New employee ID"
                         class="w-full rounded-xl border-2 border-slate-300 px-4 py-3 focus:border-indigo-600 focus:outline-none">
                     <button id="create-employee-button" class="rounded-xl bg-indigo-600 px-5 py-3 font-bold text-white hover:bg-indigo-700">Generate employee account</button>
+                </form>
+                <form id="manager-password-form" class="mt-6 grid grid-cols-1 gap-3 border-t border-slate-200 pt-5 sm:grid-cols-2" onsubmit="event.preventDefault(); updateManagerPassword();">
+                    <div class="sm:col-span-2">
+                        <h3 class="font-bold text-slate-800">Change manager login password</h3>
+                        <p class="mt-1 text-sm text-slate-600">This changes the password used for blank-ID manager login and manager confirmations. Use at least 8 characters.</p>
+                    </div>
+                    <label class="sr-only" for="new-manager-password">New manager password</label>
+                    <input id="new-manager-password" type="password" required minlength="8" autocomplete="new-password"
+                        placeholder="New manager password"
+                        class="w-full rounded-xl border-2 border-slate-300 px-4 py-3 focus:border-indigo-600 focus:outline-none">
+                    <label class="sr-only" for="confirm-manager-password">Confirm manager password</label>
+                    <input id="confirm-manager-password" type="password" required minlength="8" autocomplete="new-password"
+                        placeholder="Confirm manager password"
+                        class="w-full rounded-xl border-2 border-slate-300 px-4 py-3 focus:border-indigo-600 focus:outline-none">
+                    <button id="change-manager-password-button" class="rounded-xl bg-amber-600 px-5 py-3 font-bold text-white hover:bg-amber-700 sm:col-span-2">Update manager password</button>
                 </form>
                 <p id="employee-admin-status" role="status" class="mt-3 hidden whitespace-pre-line rounded-xl p-3 text-sm font-semibold"></p>
             </div>
@@ -6003,6 +6036,35 @@ HTML_TEMPLATE = """
                 await loadEmployeeAccounts();
             } catch (error) {
                 setEmployeeAdminStatus(error.message || 'Unable to create employee.', 'error');
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function updateManagerPassword() {
+            const passwordInput = document.getElementById('new-manager-password');
+            const confirmationInput = document.getElementById('confirm-manager-password');
+            const button = document.getElementById('change-manager-password-button');
+            if (passwordInput.value !== confirmationInput.value) {
+                setEmployeeAdminStatus('Manager passwords do not match.', 'error');
+                return;
+            }
+            button.disabled = true;
+            try {
+                const response = await fetch('/api/manager-password', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({password: passwordInput.value})
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || 'Unable to update manager password.');
+                }
+                passwordInput.value = '';
+                confirmationInput.value = '';
+                setEmployeeAdminStatus('Manager login password updated successfully.');
+            } catch (error) {
+                setEmployeeAdminStatus(error.message || 'Unable to update manager password.', 'error');
             } finally {
                 button.disabled = false;
             }
@@ -7385,7 +7447,7 @@ def authenticate():
         return jsonify({"success": False, "error": "Invalid request"}), 400
     password = str(data.get("password", ""))
     username = str(data.get("username", "")).strip().upper()
-    if not username and hmac.compare_digest(password, MANAGER_PASSWORD):
+    if not username and verify_manager_password(password):
         return jsonify({"success": True, "role": "manager"})
     if not password:
         return jsonify({"success": False, "error": "Enter your password or PIN."}), 400
@@ -7493,6 +7555,30 @@ def require_developer():
     return identity
 
 
+@app.route("/api/manager-password", methods=["POST"])
+def update_manager_password():
+    if not require_developer():
+        return jsonify({"success": False, "error": "Developer access required."}), 403
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Invalid request."}), 400
+    password = str(data.get("password", ""))
+    if len(password) < 8:
+        return jsonify({"success": False, "error": "Password must be at least 8 characters."}), 400
+
+    now = datetime.now(timezone.utc).isoformat()
+    with connect_db() as conn:
+        conn.execute(
+            """INSERT INTO portal_settings(setting_key,setting_value,updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(setting_key) DO UPDATE
+               SET setting_value=excluded.setting_value,updated_at=excluded.updated_at""",
+            ("manager_password_hash", hash_password(password), now),
+        )
+        conn.commit()
+    return jsonify({"success": True})
+
+
 @app.route("/api/employees")
 def list_employee_accounts():
     if not require_developer():
@@ -7583,7 +7669,7 @@ def delete_data():
     if not isinstance(data, dict):
         return jsonify({"success": False, "error": "Invalid request"}), 400
     password = str(data.get("password", ""))
-    if not password or not hmac.compare_digest(password, MANAGER_PASSWORD):
+    if not password or not verify_manager_password(password):
         return jsonify({"success": False, "error": "Incorrect manager password"}), 401
 
     scope = str(data.get("scope", ""))

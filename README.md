@@ -98,11 +98,14 @@ EAN; scanning a matching EAN opens its UOM, price, and print action, while
 closing the popup leaves all available UOM prices numbered below the scanner.
 Synced UOM prices are also available offline.
 
-The manager password is checked by the server before any delete action. Set a
-private `MANAGER_PASSWORD` environment variable in Vercel and local
-development; if unset, the existing password `2026` remains as a compatibility
-default. `EMPLOYEE_PASSWORD` can similarly override the existing employee PIN
-`123`. Do not put either password in source code or commit it.
+The manager password is checked by the server before manager login or any
+delete action. Set a private `MANAGER_PASSWORD` environment variable in Vercel
+and local development; if unset, the existing password `2026` remains as a
+compatibility default. A developer can change the manager login password from
+**Employee Accounts**; that hashed password is stored in the database and
+takes precedence over the environment variable. `EMPLOYEE_PASSWORD` can
+similarly override the existing employee PIN `123`. Do not put either password
+in source code or commit it.
 
 ### Employee and developer accounts
 
@@ -115,16 +118,16 @@ password is safer. Once the developer account has been created, remove this
 bootstrap environment variable. The stored password is hashed and is not
 readable.
 
-The developer role is restricted to employee account creation and password
-reset; it cannot open the Manager Panel. Employee IDs can be created in
-**Employee Accounts**. Generated/reset temporary passwords are shown only in
-that response and must be shared privately. Employees must choose a new
-password (at least 8 characters) at first login. Existing employees can migrate
-by entering their employee ID and the existing shared `EMPLOYEE_PASSWORD`;
-that first use creates an account and immediately requires a password change.
-After employees have individual accounts, change `EMPLOYEE_PASSWORD` to a new
-random value to retire the shared onboarding PIN. Sign-in requires an internet
-connection.
+The developer role can create/reset employee accounts and change the manager
+login password, but it cannot open the Manager Panel. Employee IDs can be
+created in **Employee Accounts**. Generated/reset temporary passwords are
+shown only in that response and must be shared privately. Employees must choose
+a new password (at least 8 characters) at first login. Existing employees can
+migrate by entering their employee ID and the existing shared
+`EMPLOYEE_PASSWORD`; that first use creates an account and immediately requires
+a password change. After employees have individual accounts, change
+`EMPLOYEE_PASSWORD` to a new random value to retire the shared onboarding PIN.
+Sign-in requires an internet connection.
 
 The Manager Panel provides separate deletes for the uploaded catalog, daily
 prices, Power SKU list, KVI list, and system stock. Each delete asks for the
