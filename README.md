@@ -23,9 +23,10 @@ Vercel automatically detects the Flask instance named `app` in the repository-ro
 
 ## Persistent database on Vercel (Supabase PostgreSQL)
 
-Local development uses SQLite when `DATABASE_URL` is not set. Vercel requires
-Supabase PostgreSQL and will refuse to start if `DATABASE_URL` is missing,
-instead of silently saving imported data to disposable function storage.
+Local development uses SQLite when `DATABASE_URL` is not set. Vercel should use
+Supabase PostgreSQL for persistent data. If `DATABASE_URL` is missing, the app
+starts with temporary SQLite storage so the site remains available, but
+imported data can be lost when the serverless instance is replaced.
 
 1. Create a Supabase project and open **Connect** (or **Project Settings →
    Database**).
@@ -46,7 +47,7 @@ instead of silently saving imported data to disposable function storage.
    error instead of reporting healthy temporary storage.
 
 When `DATABASE_URL` is set but the database connection fails, the app reports
-the error rather than silently switching to temporary SQLite.
+the database error rather than switching to temporary SQLite.
 
 ### Moving existing price data
 

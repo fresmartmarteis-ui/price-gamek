@@ -32,11 +32,6 @@ SESSION_TTL_SECONDS = 12 * 60 * 60
 PASSWORD_HASH_ITERATIONS = 260_000
 if not EMPLOYEE_PASSWORD or not MANAGER_PASSWORD:
     raise RuntimeError("EMPLOYEE_PASSWORD and MANAGER_PASSWORD must not be empty.")
-if IS_VERCEL and not USE_POSTGRES:
-    raise RuntimeError(
-        "DATABASE_URL must be configured on Vercel. "
-        "Refusing to use temporary SQLite storage for persistent application data."
-    )
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
