@@ -4,6 +4,7 @@ import sqlite3
 import io
 import csv
 import re
+import json
 import hmac
 import math
 import hashlib
@@ -27,7 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "uploads").strip()
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "gamek").strip()
 EMPLOYEE_PASSWORD = os.getenv("EMPLOYEE_PASSWORD", "123").strip()
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "2026").strip()
 DEVELOPER_INITIAL_PASSWORD = os.getenv("DEVELOPER_INITIAL_PASSWORD", "").strip()
@@ -74,8 +75,29 @@ def supabase_storage_request(method, object_key, body=None, content_type=None):
         with urllib.request.urlopen(req, timeout=30) as response:
             return response.read()
     except urllib.error.HTTPError as exc:
+        response_body = exc.read(2048).decode("utf-8", errors="replace").strip()
+        try:
+            error_data = json.loads(response_body)
+        except json.JSONDecodeError:
+            error_data = None
+        if isinstance(error_data, dict):
+            details = [
+                str(error_data[field])
+                for field in ("message", "error", "details", "hint", "code")
+                if error_data.get(field)
+            ]
+            response_body = "; ".join(details) or json.dumps(error_data, ensure_ascii=False)
+        elif error_data is not None:
+            response_body = (
+                error_data if isinstance(error_data, str)
+                else json.dumps(error_data, ensure_ascii=False)
+            )
+        if not response_body:
+            response_body = str(exc.reason or "")
+        response_body = " ".join(str(response_body).split())[:300]
+        detail = f": {response_body}" if response_body else ""
         raise RuntimeError(
-            f"Supabase Storage request failed with HTTP {exc.code}."
+            f"Supabase Storage request failed with HTTP {exc.code}{detail}"
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError("Unable to connect to Supabase Storage.") from exc

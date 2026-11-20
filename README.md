@@ -42,13 +42,16 @@ imported data can be lost when the serverless instance is replaced.
    `ean_aliases`, and `print_jobs` tables and seeds the bundled master data.
    Imported products, prices, aliases, and print jobs are then saved in
    Supabase and survive Vercel cold starts and redeployments.
-5. Create a **private** bucket named `uploads` in Supabase Storage (or choose a
+5. Create a **private** bucket named `gamek` in Supabase Storage (or choose a
    different bucket name), then add these Vercel environment variables:
    - `SUPABASE_URL`: the Supabase project URL.
    - `SUPABASE_SERVICE_ROLE_KEY`: the server-side service role key. Keep it
      private; never expose it to browser code or commit it.
-   - `SUPABASE_STORAGE_BUCKET`: `uploads` (optional if using that default).
+   - `SUPABASE_STORAGE_BUCKET`: `gamek` (optional if using that default).
    Add them to every environment where file uploads are enabled.
+   In the bucket settings, allow the upload size you need and leave allowed MIME
+   types unrestricted (or allow CSV, XLS, and XLSX files). Supabase enforces
+   these bucket limits even for server-side uploads using the service-role key.
 6. Redeploy and visit `/api/health`; it should return HTTP 200 with
    `"database": "postgres"` and `"storage": "supabase"`. A missing or
    unreachable database or missing Storage configuration returns an error
