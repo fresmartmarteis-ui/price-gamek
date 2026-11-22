@@ -42,81 +42,22 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 def supabase_storage_enabled():
-    has_url = bool(SUPABASE_URL)
-    has_key = bool(SUPABASE_SERVICE_ROLE_KEY)
-    if has_url != has_key:
-        raise RuntimeError(
-            "Configure both SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for file storage."
-        )
-    if not has_url and IS_VERCEL:
-        raise RuntimeError(
-            "Supabase Storage is required on Vercel. Configure "
-            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
-        )
-    if has_url and not SUPABASE_STORAGE_BUCKET:
-        raise RuntimeError("SUPABASE_STORAGE_BUCKET must not be empty.")
-    return has_url
+    # Excel/CSV uploads are processed directly; no Storage bucket is required.
+    return False
 
 
 def supabase_storage_request(method, object_key, body=None, content_type=None):
-    bucket = urllib.parse.quote(SUPABASE_STORAGE_BUCKET, safe="")
-    key = urllib.parse.quote(object_key, safe="/")
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{key}"
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-    }
-    if content_type:
-        headers["Content-Type"] = content_type
-    if method == "POST":
-        headers["x-upsert"] = "false"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        response_body = exc.read(2048).decode("utf-8", errors="replace").strip()
-        try:
-            error_data = json.loads(response_body)
-        except json.JSONDecodeError:
-            error_data = None
-        if isinstance(error_data, dict):
-            details = [
-                str(error_data[field])
-                for field in ("message", "error", "details", "hint", "code")
-                if error_data.get(field)
-            ]
-            response_body = "; ".join(details) or json.dumps(error_data, ensure_ascii=False)
-        elif error_data is not None:
-            response_body = (
-                error_data if isinstance(error_data, str)
-                else json.dumps(error_data, ensure_ascii=False)
-            )
-        if not response_body:
-            response_body = str(exc.reason or "")
-        response_body = " ".join(str(response_body).split())[:300]
-        detail = f": {response_body}" if response_body else ""
-        raise RuntimeError(
-            f"Supabase Storage request failed with HTTP {exc.code}{detail}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError("Unable to connect to Supabase Storage.") from exc
+    raise RuntimeError("Supabase Storage is disabled for direct uploads.")
 
 
 def archive_uploaded_file(object_key, file_bytes, content_type):
-    if not supabase_storage_enabled():
-        return False
-    supabase_storage_request("POST", object_key, file_bytes, content_type)
-    return True
+    # Keep the temporary upload in /tmp for the preview/import flow.
+    return False
 
 
 def restore_uploaded_file(object_key, local_path):
-    if not supabase_storage_enabled():
-        return os.path.isfile(local_path)
-    file_bytes = supabase_storage_request("GET", object_key)
-    with open(local_path, "wb") as saved_file:
-        saved_file.write(file_bytes)
-    return True
+    # The uploaded file is already available in the temporary upload folder.
+    return os.path.exists(local_path)
 
 
 class DatabaseConnection:
@@ -8890,11 +8831,7 @@ def health():
         "ok": True,
         "platform": "vercel" if IS_VERCEL else "local",
         "database": "postgres" if USE_POSTGRES else DB_NAME,
-        "storage": (
-            "supabase"
-            if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
-            else ("unconfigured" if IS_VERCEL else "local")
-        ),
+        "storage": "direct-temporary-upload",
     }
     try:
         with connect_db() as conn:
@@ -8903,12 +8840,6 @@ def health():
         app.logger.exception("Database health check failed")
         health_data["ok"] = False
         health_data["error"] = "Database connection failed"
-        return jsonify(health_data), 503
-    try:
-        supabase_storage_enabled()
-    except RuntimeError as exc:
-        health_data["ok"] = False
-        health_data["error"] = str(exc)
         return jsonify(health_data), 503
     return jsonify(health_data)
 
